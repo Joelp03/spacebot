@@ -21,7 +21,7 @@ use crate::hooks::SpacebotHook;
 use crate::llm::SpacebotModel;
 use crate::{
     AgentDeps, BranchId, ChannelId, InboundMessage, OutboundResponse, ProcessEvent, ProcessId,
-    ProcessType, WorkerId,
+    ProcessType, RoutedResponse, RoutedSender, WorkerId,
 };
 use rig::agent::AgentBuilder;
 use rig::completion::CompletionModel;
@@ -329,9 +329,12 @@ pub struct Channel {
     /// Event receiver for process events.
     pub event_rx: broadcast::Receiver<ProcessEvent>,
     /// Outbound response sender for the messaging layer.
-    pub response_tx: mpsc::Sender<OutboundResponse>,
+    pub response_tx: mpsc::Sender<RoutedResponse>,
     /// Self-sender for re-triggering the channel after background process completion.
     pub self_tx: mpsc::Sender<InboundMessage>,
+    /// The inbound message currently being processed. Used to pair outbound
+    /// responses with the correct platform routing metadata (e.g. Slack thread_ts).
+    current_inbound: Option<InboundMessage>,
     /// Conversation ID from the first message (for synthetic re-trigger messages).
     pub conversation_id: Option<String>,
     /// Adapter source captured from the first non-system message.
@@ -405,7 +408,7 @@ impl Channel {
     pub fn new(
         id: ChannelId,
         deps: AgentDeps,
-        response_tx: mpsc::Sender<OutboundResponse>,
+        response_tx: mpsc::Sender<RoutedResponse>,
         event_rx: broadcast::Receiver<ProcessEvent>,
         screenshot_dir: std::path::PathBuf,
         logs_dir: std::path::PathBuf,
@@ -486,6 +489,7 @@ impl Channel {
             event_rx,
             response_tx,
             self_tx,
+            current_inbound: None,
             conversation_id: None,
             source_adapter: None,
             conversation_context: None,
@@ -778,12 +782,35 @@ impl Channel {
         (invoked_by_command, invoked_by_mention, invoked_by_reply)
     }
 
+    /// Send a routed response paired with the current inbound message.
+    ///
+    /// Falls back to a bare response with a placeholder target if no inbound
+    /// message is set (should not happen during normal turn processing).
+    async fn send_routed(
+        &self,
+        response: OutboundResponse,
+    ) -> std::result::Result<(), mpsc::error::SendError<RoutedResponse>> {
+        let routed = match &self.current_inbound {
+            Some(target) => RoutedResponse {
+                response,
+                target: target.clone(),
+            },
+            None => {
+                tracing::warn!(
+                    channel_id = %self.id,
+                    "sending response without a current inbound message"
+                );
+                RoutedResponse {
+                    response,
+                    target: InboundMessage::empty(),
+                }
+            }
+        };
+        self.response_tx.send(routed).await
+    }
+
     async fn send_builtin_text(&mut self, text: String, log_label: &str) {
-        match self
-            .response_tx
-            .send(OutboundResponse::Text(text.clone()))
-            .await
-        {
+        match self.send_routed(OutboundResponse::Text(text.clone())).await {
             Ok(()) => {
                 #[cfg(feature = "metrics")]
                 {
@@ -823,7 +850,7 @@ impl Channel {
         }
         let supported_source = matches!(
             message.source.as_str(),
-            "telegram" | "discord" | "slack" | "twitch"
+            "telegram" | "discord" | "slack" | "twitch" | "signal"
         );
         if !supported_source {
             return Ok(false);
@@ -1202,11 +1229,13 @@ impl Channel {
             self.conversation_id = Some(first.conversation_id.clone());
         }
 
+        // Track source adapter from the first non-system message
+        // Prefer message.adapter (full adapter string like "signal:work") over message.source
         if self.source_adapter.is_none()
             && let Some(first) = messages.first()
             && first.source != "system"
         {
-            self.source_adapter = Some(first.source.clone());
+            self.source_adapter = first.adapter.clone().or_else(|| Some(first.source.clone()));
         }
 
         // Capture conversation context from the first message
@@ -1408,9 +1437,23 @@ impl Channel {
             .build_system_prompt_with_coalesce(message_count, elapsed_secs, unique_sender_count)
             .await?;
 
+        // Extract adapter from messages (prefer explicit message.adapter, fall back to stored source_adapter)
+        // This preserves per-message adapter for Signal named instances (e.g., "signal:work")
+        let batch_adapter = messages
+            .iter()
+            .find_map(|m| m.adapter.as_deref())
+            .or(self.source_adapter.as_deref());
+
         {
             let mut reply_target = self.state.reply_target_message_id.write().await;
             *reply_target = messages.iter().rev().find_map(extract_message_id);
+        }
+
+        // Pin the inbound routing target from the last non-system message in the
+        // batch so the RoutedSender (and send_routed) carry the correct platform
+        // metadata (e.g. Slack thread_ts) for outbound responses.
+        if let Some(last_real) = messages.iter().rev().find(|m| m.source != "system") {
+            self.current_inbound = Some(last_real.clone());
         }
 
         // Run agent turn with any image/audio attachments preserved
@@ -1421,6 +1464,7 @@ impl Channel {
                 &conversation_id,
                 attachment_parts,
                 false, // not a retrigger
+                batch_adapter,
             )
             .await?;
 
@@ -1518,6 +1562,13 @@ impl Channel {
         // Apply runtime-config updates immediately without requiring a restart.
         self.sync_listen_only_mode_from_runtime();
 
+        // Track the inbound message that triggered this turn so outbound
+        // responses carry the correct routing metadata (e.g. Slack thread_ts).
+        // System retrigger messages keep the previous inbound target.
+        if message.source != "system" {
+            self.current_inbound = Some(message.clone());
+        }
+
         tracing::info!(
             channel_id = %self.id,
             message_id = %message.id,
@@ -1552,8 +1603,13 @@ impl Channel {
             self.conversation_id = Some(message.conversation_id.clone());
         }
 
+        // Track source adapter from non-system messages
+        // Prefer message.adapter (full adapter string like "signal:work") over message.source
         if self.source_adapter.is_none() && message.source != "system" {
-            self.source_adapter = Some(message.source.clone());
+            self.source_adapter = message
+                .adapter
+                .clone()
+                .or_else(|| Some(message.source.clone()));
         }
 
         let (raw_text, attachments) = match &message.content {
@@ -1743,6 +1799,10 @@ impl Channel {
             Vec::new()
         };
 
+        let adapter = message
+            .adapter
+            .as_deref()
+            .or_else(|| self.current_adapter());
         let (result, skip_flag, replied_flag, retrigger_reply_preserved) = self
             .run_agent_turn(
                 &user_text,
@@ -1750,6 +1810,7 @@ impl Channel {
                 &message.conversation_id,
                 attachment_content,
                 is_retrigger,
+                adapter,
             )
             .await?;
 
@@ -1765,7 +1826,7 @@ impl Channel {
             && !replied_flag.load(std::sync::atomic::Ordering::Relaxed)
             && matches!(
                 message.source.as_str(),
-                "discord" | "telegram" | "slack" | "twitch"
+                "discord" | "telegram" | "slack" | "twitch" | "signal"
             )
         {
             self.send_builtin_text(
@@ -2171,6 +2232,7 @@ impl Channel {
         conversation_id: &str,
         attachment_content: Vec<UserContent>,
         is_retrigger: bool,
+        adapter: Option<&str>,
     ) -> Result<(
         std::result::Result<String, rig::completion::PromptError>,
         crate::tools::SkipFlag,
@@ -2188,16 +2250,32 @@ impl Channel {
             .clone()
             .map(|tool| tool.with_originating_channel(conversation_id.to_string()));
 
+        let current_inbound = self
+            .current_inbound
+            .clone()
+            .unwrap_or_else(InboundMessage::empty);
+        let routed_sender = RoutedSender::new(self.response_tx.clone(), current_inbound.clone());
+
+        // Extract Slack thread_ts from the current inbound message so cron
+        // delivery targets include the originating thread.
+        let slack_thread_ts = current_inbound
+            .metadata
+            .get("slack_thread_ts")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         if let Err(error) = crate::tools::add_channel_tools(
             &self.tool_server,
             self.state.clone(),
-            self.response_tx.clone(),
+            routed_sender,
             conversation_id,
             skip_flag.clone(),
             replied_flag.clone(),
             self.deps.cron_tool.clone(),
             send_agent_message_tool,
             allow_direct_reply,
+            adapter.map(|s| s.to_string()),
+            slack_thread_ts.as_deref(),
         )
         .await
         {
@@ -2223,10 +2301,9 @@ impl Channel {
             .tool_server_handle(self.tool_server.clone())
             .build();
 
-        let _ = self
-            .response_tx
-            .send(OutboundResponse::Status(crate::StatusUpdate::Thinking))
-            .await;
+        self.send_routed(OutboundResponse::Status(crate::StatusUpdate::Thinking))
+            .await
+            .ok();
 
         // Inject attachments as a user message before the text prompt
         if !attachment_content.is_empty() {
@@ -2325,7 +2402,7 @@ impl Channel {
 
     /// Send outbound text and record send metrics.
     async fn send_outbound_text(&self, text: String, error_context: &str) {
-        match self.response_tx.send(OutboundResponse::Text(text)).await {
+        match self.send_routed(OutboundResponse::Text(text)).await {
             Ok(()) => {
                 #[cfg(feature = "metrics")]
                 {
@@ -2582,15 +2659,19 @@ impl Channel {
                     .channel_errors_total
                     .with_label_values(&[metrics_agent_id, metrics_channel_type, "llm_error"])
                     .inc();
+                // Send error to user so they know something went wrong
+                let error_msg = format!("I encountered an error: {}", error);
+                self.send_routed(OutboundResponse::Text(error_msg))
+                    .await
+                    .ok();
                 tracing::error!(channel_id = %self.id, %error, "channel LLM call failed");
             }
         }
 
         // Ensure typing indicator is always cleaned up, even on error paths
-        let _ = self
-            .response_tx
-            .send(OutboundResponse::Status(crate::StatusUpdate::StopTyping))
-            .await;
+        self.send_routed(OutboundResponse::Status(crate::StatusUpdate::StopTyping))
+            .await
+            .ok();
     }
 
     /// Handle a process event (branch results, worker completions, status updates).

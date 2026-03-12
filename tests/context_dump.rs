@@ -225,7 +225,8 @@ async fn dump_channel_context() {
     let status_block = Arc::new(tokio::sync::RwLock::new(
         spacebot::agent::status::StatusBlock::new(),
     ));
-    let (response_tx, _response_rx) = tokio::sync::mpsc::channel(16);
+    let (raw_tx, _response_rx) = tokio::sync::mpsc::channel(16);
+    let response_tx = spacebot::RoutedSender::new(raw_tx, spacebot::InboundMessage::empty());
 
     let state = spacebot::agent::channel::ChannelState {
         channel_id,
@@ -260,6 +261,8 @@ async fn dump_channel_context() {
         None,
         None,
         true,
+        None,
+        None,
     )
     .await
     .expect("failed to add channel tools");
@@ -322,6 +325,7 @@ async fn dump_branch_context() {
         conversation_logger,
         channel_store,
         run_logger,
+        spacebot::tools::BranchToolProfile::Default,
     );
 
     let tool_defs = branch_tool_server
@@ -457,7 +461,8 @@ async fn dump_all_contexts() {
     let channel_prompt = build_channel_system_prompt(rc);
 
     let channel_id: spacebot::ChannelId = Arc::from("test-channel");
-    let (response_tx, _response_rx) = tokio::sync::mpsc::channel(16);
+    let (raw_tx, _response_rx) = tokio::sync::mpsc::channel(16);
+    let response_tx = spacebot::RoutedSender::new(raw_tx, spacebot::InboundMessage::empty());
     let state = spacebot::agent::channel::ChannelState {
         channel_id,
         history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -492,6 +497,8 @@ async fn dump_all_contexts() {
         None,
         None,
         true,
+        None,
+        None,
     )
     .await
     .expect("failed to add channel tools");
@@ -523,6 +530,7 @@ async fn dump_all_contexts() {
         conversation_logger,
         channel_store,
         run_logger,
+        spacebot::tools::BranchToolProfile::Default,
     );
     let branch_tool_defs = branch_tool_server.get_tool_defs(None).await.unwrap();
     let branch_tools_text = format_tool_defs(&branch_tool_defs);
