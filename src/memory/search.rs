@@ -99,12 +99,28 @@ impl MemorySearch {
         query: &str,
         config: &SearchConfig,
     ) -> Result<Vec<MemorySearchResult>> {
-        match config.mode {
+        let results = match config.mode {
             SearchMode::Hybrid => self.hybrid_search(query, config).await,
             SearchMode::Recent => self.metadata_search(SearchSort::Recent, config).await,
             SearchMode::Important => self.metadata_search(SearchSort::Importance, config).await,
             SearchMode::Typed => self.metadata_search(config.sort_by, config).await,
+        }?;
+
+        #[cfg(feature = "metrics")]
+        {
+            let agent_id = self.store.agent_id();
+            let agent_label = if agent_id.is_empty() {
+                "unknown"
+            } else {
+                agent_id
+            };
+            crate::telemetry::Metrics::global()
+                .memory_search_results
+                .with_label_values(&[agent_label])
+                .observe(results.len() as f64);
         }
+
+        Ok(results)
     }
 
     /// Metadata-based search: queries SQLite directly, no vector/FTS/RRF.
@@ -163,13 +179,13 @@ impl MemorySearch {
         {
             Ok(fts_matches) => {
                 for (memory_id, score) in fts_matches {
-                    if let Some(memory) = self.store.load(&memory_id).await? {
-                        if !memory.forgotten {
-                            fts_results.push(ScoredMemory {
-                                memory,
-                                score: score as f64,
-                            });
-                        }
+                    if let Some(memory) = self.store.load(&memory_id).await?
+                        && !memory.forgotten
+                    {
+                        fts_results.push(ScoredMemory {
+                            memory,
+                            score: score as f64,
+                        });
                     }
                 }
             }
@@ -188,13 +204,13 @@ impl MemorySearch {
             Ok(vector_matches) => {
                 for (memory_id, distance) in vector_matches {
                     let similarity = 1.0 - distance;
-                    if let Some(memory) = self.store.load(&memory_id).await? {
-                        if !memory.forgotten {
-                            vector_results.push(ScoredMemory {
-                                memory,
-                                score: similarity as f64,
-                            });
-                        }
+                    if let Some(memory) = self.store.load(&memory_id).await?
+                        && !memory.forgotten
+                    {
+                        vector_results.push(ScoredMemory {
+                            memory,
+                            score: similarity as f64,
+                        });
                     }
                 }
             }

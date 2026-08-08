@@ -1,24 +1,70 @@
 //! Memory save tool for channels and branches.
 
 use crate::error::Result;
-use crate::memory::types::{Association, CreateAssociationInput};
+use crate::memory::types::Association;
 use crate::memory::{Memory, MemorySearch, MemoryType};
+use crate::{AgentId, ProcessEvent};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+/// Maximum allowed memory content length (bytes). Prevents oversized memories
+/// from bloating the database and embedding index.
+const MAX_MEMORY_CONTENT_BYTES: usize = 50_000;
+
 /// Tool for saving memories to the store.
 #[derive(Debug, Clone)]
 pub struct MemorySaveTool {
     memory_search: Arc<MemorySearch>,
+    event_context: Option<MemorySaveEventContext>,
+    contract_state: Option<Arc<super::memory_persistence_complete::MemoryPersistenceContractState>>,
+    working_memory: Option<Arc<crate::memory::WorkingMemoryStore>>,
+}
+
+#[derive(Debug, Clone)]
+struct MemorySaveEventContext {
+    agent_id: AgentId,
+    memory_event_tx: tokio::sync::broadcast::Sender<ProcessEvent>,
 }
 
 impl MemorySaveTool {
     /// Create a new memory save tool.
     pub fn new(memory_search: Arc<MemorySearch>) -> Self {
-        Self { memory_search }
+        Self {
+            memory_search,
+            event_context: None,
+            contract_state: None,
+            working_memory: None,
+        }
+    }
+
+    /// Enable process event emission for successful memory saves.
+    pub fn with_event_bus(
+        mut self,
+        agent_id: AgentId,
+        memory_event_tx: tokio::sync::broadcast::Sender<ProcessEvent>,
+    ) -> Self {
+        self.event_context = Some(MemorySaveEventContext {
+            agent_id,
+            memory_event_tx,
+        });
+        self
+    }
+
+    pub fn with_contract_state(
+        mut self,
+        contract_state: Arc<super::memory_persistence_complete::MemoryPersistenceContractState>,
+    ) -> Self {
+        self.contract_state = Some(contract_state);
+        self
+    }
+
+    /// Enable working memory event emission for successful memory saves.
+    pub fn with_working_memory(mut self, store: Arc<crate::memory::WorkingMemoryStore>) -> Self {
+        self.working_memory = Some(store);
+        self
     }
 }
 
@@ -160,6 +206,25 @@ impl Tool for MemorySaveTool {
     }
 
     async fn call(&self, args: Self::Args) -> std::result::Result<Self::Output, Self::Error> {
+        if args.content.is_empty() {
+            return Err(MemorySaveError("content must not be empty".into()));
+        }
+
+        if args.content.len() > MAX_MEMORY_CONTENT_BYTES {
+            return Err(MemorySaveError(format!(
+                "content exceeds maximum length of {MAX_MEMORY_CONTENT_BYTES} bytes (got {})",
+                args.content.len()
+            )));
+        }
+
+        if let Some(importance) = args.importance
+            && !(0.0..=1.0).contains(&importance)
+        {
+            return Err(MemorySaveError(format!(
+                "importance must be between 0.0 and 1.0 (got {importance})"
+            )));
+        }
+
         // Parse memory type
         let memory_type = match args.memory_type.as_str() {
             "fact" => MemoryType::Fact,
@@ -206,6 +271,29 @@ impl Tool for MemorySaveTool {
                 _ => crate::memory::types::RelationType::RelatedTo,
             };
 
+            // Verify the target memory exists before creating a graph edge
+            // to prevent dangling associations from LLM hallucinated IDs.
+            match store.load(&assoc.target_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::warn!(
+                        memory_id = %memory.id,
+                        target_id = %assoc.target_id,
+                        "skipping association to non-existent memory"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        memory_id = %memory.id,
+                        target_id = %assoc.target_id,
+                        %error,
+                        "failed to verify target memory for association"
+                    );
+                    continue;
+                }
+            }
+
             let association = Association::new(&memory.id, &assoc.target_id, relation_type)
                 .with_weight(assoc.weight);
 
@@ -219,19 +307,77 @@ impl Tool for MemorySaveTool {
             }
         }
 
-        // Generate and store embedding (async to avoid blocking the tokio runtime)
-        let embedding = self
+        // Generate and store embedding. On failure, compensate by deleting the
+        // SQLite row (and any associations already written) so there is no orphan.
+        let embedding = match self
             .memory_search
             .embedding_model_arc()
             .embed_one(&args.content)
             .await
-            .map_err(|e| MemorySaveError(format!("Failed to generate embedding: {e}")))?;
+        {
+            Ok(emb) => emb,
+            Err(embed_err) => {
+                if let Err(assoc_err) = self
+                    .memory_search
+                    .store()
+                    .delete_associations_for_memory(&memory.id)
+                    .await
+                {
+                    tracing::error!(
+                        memory_id = %memory.id,
+                        error = %assoc_err,
+                        "compensating association delete failed after embedding generation error"
+                    );
+                }
+                if let Err(del_err) = self.memory_search.store().delete(&memory.id).await {
+                    tracing::error!(
+                        memory_id = %memory.id,
+                        %del_err,
+                        "compensating delete failed after embedding generation error"
+                    );
+                }
+                return Err(MemorySaveError(format!(
+                    "Failed to generate embedding: {embed_err}"
+                )));
+            }
+        };
 
-        self.memory_search
+        match self
+            .memory_search
             .embedding_table()
             .store(&memory.id, &args.content, &embedding)
             .await
-            .map_err(|e| MemorySaveError(format!("Failed to store embedding: {e}")))?;
+        {
+            Ok(()) => {
+                if let Some(contract_state) = &self.contract_state {
+                    contract_state.record_saved_memory_id(memory.id.clone());
+                }
+            }
+            Err(embed_err) => {
+                if let Err(assoc_err) = self
+                    .memory_search
+                    .store()
+                    .delete_associations_for_memory(&memory.id)
+                    .await
+                {
+                    tracing::error!(
+                        memory_id = %memory.id,
+                        error = %assoc_err,
+                        "compensating association delete failed after embedding store error"
+                    );
+                }
+                if let Err(del_err) = self.memory_search.store().delete(&memory.id).await {
+                    tracing::error!(
+                        memory_id = %memory.id,
+                        %del_err,
+                        "compensating delete failed after embedding store error"
+                    );
+                }
+                return Err(MemorySaveError(format!(
+                    "Failed to store embedding: {embed_err}"
+                )));
+            }
+        }
 
         // Ensure the FTS index exists so full_text_search queries work.
         // Safe to call repeatedly — no-ops if the index already exists.
@@ -244,10 +390,61 @@ impl Tool for MemorySaveTool {
             tracing::warn!(%error, "failed to ensure FTS index after memory save");
         }
 
+        if let Some(event_context) = &self.event_context
+            && event_context.memory_event_tx.receiver_count() > 0
+        {
+            let event = ProcessEvent::MemorySaved {
+                agent_id: event_context.agent_id.clone(),
+                memory_id: memory.id.clone(),
+                channel_id: memory
+                    .channel_id
+                    .as_ref()
+                    .map(|s| std::sync::Arc::from(s.as_str())),
+                memory_type: memory.memory_type,
+                importance: memory.importance,
+                content_summary: summarize_memory_content(&memory.content),
+            };
+            if let Err(error) = event_context.memory_event_tx.send(event) {
+                tracing::debug!(
+                    memory_id = %memory.id,
+                    %error,
+                    "failed to emit memory-saved event"
+                );
+            }
+        }
+
+        if let Some(working_memory) = &self.working_memory {
+            let content_preview = summarize_memory_content(&memory.content);
+            let mut builder = working_memory
+                .emit(
+                    crate::memory::WorkingMemoryEventType::MemorySaved,
+                    format!("Memory saved ({}): {content_preview}", memory.memory_type),
+                )
+                .importance(0.5);
+            if let Some(channel_id) = &memory.channel_id {
+                builder = builder.channel(channel_id.to_string());
+            }
+            builder.record();
+        }
+
         #[cfg(feature = "metrics")]
-        crate::telemetry::Metrics::global()
-            .memory_writes_total
-            .inc();
+        {
+            let agent_id = self.memory_search.store().agent_id();
+            let agent_label = if agent_id.is_empty() {
+                "unknown"
+            } else {
+                agent_id
+            };
+            let metrics = crate::telemetry::Metrics::global();
+            metrics
+                .memory_writes_total
+                .with_label_values(&[agent_label])
+                .inc();
+            metrics
+                .memory_updates_total
+                .with_label_values(&[agent_label, "save"])
+                .inc();
+        }
 
         Ok(MemorySaveOutput {
             memory_id: memory.id,
@@ -278,4 +475,26 @@ pub async fn save_fact(
         .await
         .map_err(|e| crate::error::AgentError::Other(anyhow::anyhow!(e)))?;
     Ok(output.memory_id)
+}
+
+fn summarize_memory_content(content: &str) -> String {
+    crate::summarize_first_non_empty_line(content, crate::EVENT_SUMMARY_MAX_CHARS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarize_memory_content;
+
+    #[test]
+    fn summarize_memory_content_prefers_first_non_empty_line() {
+        let content = "\n\nFirst line summary\nSecond line details";
+        assert_eq!(summarize_memory_content(content), "First line summary");
+    }
+
+    #[test]
+    fn summarize_memory_content_truncates_to_max_chars() {
+        let content = "a".repeat(200);
+        let summary = summarize_memory_content(&content);
+        assert_eq!(summary.chars().count(), crate::EVENT_SUMMARY_MAX_CHARS);
+    }
 }

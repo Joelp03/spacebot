@@ -14,12 +14,22 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct MemoryDeleteTool {
     memory_search: Arc<MemorySearch>,
+    runtime_config: Option<Arc<crate::config::RuntimeConfig>>,
 }
 
 impl MemoryDeleteTool {
     /// Create a new memory delete tool.
     pub fn new(memory_search: Arc<MemorySearch>) -> Self {
-        Self { memory_search }
+        Self {
+            memory_search,
+            runtime_config: None,
+        }
+    }
+
+    /// Enable knowledge synthesis dirty-flag bumping on delete.
+    pub fn with_runtime_config(mut self, config: Arc<crate::config::RuntimeConfig>) -> Self {
+        self.runtime_config = Some(config);
+        self
     }
 }
 
@@ -109,6 +119,16 @@ impl Tool for MemoryDeleteTool {
             .unwrap_or_default();
 
         if was_forgotten {
+            #[cfg(feature = "metrics")]
+            crate::telemetry::Metrics::global()
+                .memory_updates_total
+                .with_label_values(&["unknown", "forget"])
+                .inc();
+
+            if let Some(rc) = &self.runtime_config {
+                rc.bump_knowledge_synthesis_version();
+            }
+
             tracing::info!(
                 memory_id = %args.memory_id,
                 memory_type = %memory.memory_type,

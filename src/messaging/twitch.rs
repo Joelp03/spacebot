@@ -1,25 +1,105 @@
 //! Twitch chat messaging adapter using twitch-irc.
 
 use crate::config::TwitchPermissions;
+use crate::messaging::apply_runtime_adapter_to_conversation_id;
 use crate::messaging::traits::{InboundStream, Messaging};
 use crate::{InboundMessage, MessageContent, OutboundResponse};
 
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
-use twitch_irc::login::StaticLoginCredentials;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use twitch_irc::login::{RefreshingLoginCredentials, TokenStorage, UserAccessToken};
 use twitch_irc::message::ServerMessage;
 use twitch_irc::{ClientConfig, SecureTCPTransport, TwitchIRCClient};
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 
-type IrcClient = TwitchIRCClient<SecureTCPTransport, StaticLoginCredentials>;
+#[derive(Serialize, Deserialize)]
+struct TwitchTokenFile {
+    access_token: String,
+    refresh_token: String,
+    created_at: Option<DateTime<Utc>>,
+    expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug)]
+struct TwitchTokenStorage {
+    access_token: String,
+    refresh_token: String,
+    token_path: Option<PathBuf>,
+}
+
+#[async_trait]
+impl TokenStorage for TwitchTokenStorage {
+    type LoadError = String;
+    type UpdateError = String;
+
+    async fn load_token(&mut self) -> Result<UserAccessToken, Self::LoadError> {
+        let mut created_at = Utc::now();
+
+        if let Some(path) = &self.token_path
+            && let Ok(data) = std::fs::read_to_string(path)
+            && let Ok(file) = serde_json::from_str::<TwitchTokenFile>(&data)
+        {
+            self.access_token = file.access_token;
+            self.refresh_token = file.refresh_token;
+            if let Some(stored_created) = file.created_at {
+                created_at = stored_created;
+            }
+        }
+
+        // Never return expires_at from load_token. The twitch-irc library's
+        // RefreshingLoginCredentials will attempt an OAuth token refresh
+        // whenever it sees an expired/near-expired token, and if the refresh
+        // credentials are invalid it spin-loops with no backoff. By always
+        // returning expires_at = None here, we treat the access token as
+        // non-expiring on load. Real expiry data is only set via
+        // update_token() after a *successful* library-driven refresh.
+        Ok(UserAccessToken {
+            access_token: self.access_token.clone(),
+            refresh_token: self.refresh_token.clone(),
+            created_at,
+            expires_at: None,
+        })
+    }
+
+    async fn update_token(&mut self, token: &UserAccessToken) -> Result<(), Self::UpdateError> {
+        self.access_token = token.access_token.clone();
+        self.refresh_token = token.refresh_token.clone();
+
+        if let Some(path) = &self.token_path {
+            let file = TwitchTokenFile {
+                access_token: self.access_token.clone(),
+                refresh_token: self.refresh_token.clone(),
+                created_at: Some(token.created_at),
+                expires_at: token.expires_at,
+            };
+            if let Ok(data) = serde_json::to_string_pretty(&file) {
+                let _ = std::fs::write(path, data);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+type TwitchCredentials = RefreshingLoginCredentials<TwitchTokenStorage>;
+type IrcClient = TwitchIRCClient<SecureTCPTransport, TwitchCredentials>;
 
 /// Twitch chat adapter state.
 pub struct TwitchAdapter {
+    runtime_key: String,
     username: String,
     oauth_token: String,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    refresh_token: Option<String>,
+    token_path: Option<PathBuf>,
     channels: Vec<String>,
     trigger_prefix: Option<String>,
     permissions: Arc<ArcSwap<TwitchPermissions>>,
@@ -31,16 +111,27 @@ pub struct TwitchAdapter {
 const MAX_MESSAGE_LENGTH: usize = 500;
 
 impl TwitchAdapter {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        runtime_key: impl Into<String>,
         username: impl Into<String>,
         oauth_token: impl Into<String>,
+        client_id: Option<String>,
+        client_secret: Option<String>,
+        refresh_token: Option<String>,
+        token_path: Option<PathBuf>,
         channels: Vec<String>,
         trigger_prefix: Option<String>,
         permissions: Arc<ArcSwap<TwitchPermissions>>,
     ) -> Self {
         Self {
+            runtime_key: runtime_key.into(),
             username: username.into(),
             oauth_token: oauth_token.into(),
+            client_id,
+            client_secret,
+            refresh_token,
+            token_path,
             channels,
             trigger_prefix,
             permissions,
@@ -52,7 +143,7 @@ impl TwitchAdapter {
 
 impl Messaging for TwitchAdapter {
     fn name(&self) -> &str {
-        "twitch"
+        &self.runtime_key
     }
 
     async fn start(&self) -> crate::Result<InboundStream> {
@@ -68,11 +159,32 @@ impl Messaging for TwitchAdapter {
             .unwrap_or(&self.oauth_token)
             .to_string();
 
-        let credentials = StaticLoginCredentials::new(self.username.clone(), Some(token));
+        let refresh_token = self.refresh_token.clone().unwrap_or_default();
+        let client_id = self.client_id.clone().unwrap_or_default();
+        let client_secret = self.client_secret.clone().unwrap_or_default();
+
+        if refresh_token.is_empty() || client_id.is_empty() || client_secret.is_empty() {
+            tracing::info!(
+                adapter = %self.runtime_key,
+                "twitch token refresh disabled (missing client_id, client_secret, or refresh_token)"
+            );
+        }
+
+        let storage = TwitchTokenStorage {
+            access_token: token,
+            refresh_token,
+            token_path: self.token_path.clone(),
+        };
+        let credentials = TwitchCredentials::init_with_username(
+            Some(self.username.clone()),
+            client_id,
+            client_secret,
+            storage,
+        );
         let config = ClientConfig::new_simple(credentials);
 
         let (mut incoming, client) =
-            TwitchIRCClient::<SecureTCPTransport, StaticLoginCredentials>::new(config);
+            TwitchIRCClient::<SecureTCPTransport, TwitchCredentials>::new(config);
 
         // Join configured channels
         for channel in &self.channels {
@@ -93,6 +205,7 @@ impl Messaging for TwitchAdapter {
         let permissions = self.permissions.clone();
         let bot_username = self.username.to_lowercase();
         let trigger_prefix = self.trigger_prefix.clone();
+        let runtime_key = self.runtime_key.clone();
 
         tokio::spawn(async move {
             loop {
@@ -119,11 +232,10 @@ impl Messaging for TwitchAdapter {
                         let permissions = permissions.load();
 
                         // Channel filter
-                        if let Some(filter) = &permissions.channel_filter {
-                            if !filter.iter().any(|c| c.eq_ignore_ascii_case(&privmsg.channel_login)) {
+                        if let Some(filter) = &permissions.channel_filter
+                            && !filter.iter().any(|c| c.eq_ignore_ascii_case(&privmsg.channel_login)) {
                                 continue;
                             }
-                        }
 
                         // User filter
                         if !permissions.allowed_users.is_empty()
@@ -145,15 +257,27 @@ impl Messaging for TwitchAdapter {
                         }
 
                         let channel_login = privmsg.channel_login.clone();
-                        let conversation_id = format!("twitch:{channel_login}");
+                        let base_conversation_id = format!("twitch:{channel_login}");
+                        let conversation_id = apply_runtime_adapter_to_conversation_id(
+                            &runtime_key,
+                            base_conversation_id,
+                        );
 
                         let mut metadata = HashMap::new();
                         metadata.insert(
                             "twitch_channel".into(),
+                            serde_json::Value::String(channel_login.clone()),
+                        );
+                        metadata.insert(
+                            crate::metadata_keys::CHANNEL_NAME.into(),
                             serde_json::Value::String(channel_login),
                         );
                         metadata.insert(
                             "twitch_message_id".into(),
+                            serde_json::Value::String(privmsg.message_id.clone()),
+                        );
+                        metadata.insert(
+                            crate::metadata_keys::MESSAGE_ID.into(),
                             serde_json::Value::String(privmsg.message_id.clone()),
                         );
                         metadata.insert(
@@ -165,8 +289,37 @@ impl Messaging for TwitchAdapter {
                             serde_json::Value::String(privmsg.sender.login.clone()),
                         );
                         metadata.insert(
+                            "twitch_bot_login".into(),
+                            serde_json::Value::String(bot_username.clone()),
+                        );
+                        metadata.insert(
                             "sender_display_name".into(),
                             serde_json::Value::String(privmsg.sender.name.clone()),
+                        );
+                        let message_lower = privmsg.message_text.to_lowercase();
+                        let mention = format!("@{bot_username}");
+                        let is_login_char = |character: char| {
+                            character.is_ascii_lowercase()
+                                || character.is_ascii_digit()
+                                || character == '_'
+                        };
+                        let mentions_bot = message_lower.match_indices(&mention).any(|(start, _)| {
+                            let before = message_lower[..start].chars().next_back();
+                            let after = message_lower[start + mention.len()..].chars().next();
+                            let before_ok = before.map(|character| !is_login_char(character)).unwrap_or(true);
+                            let after_ok = after.map(|character| !is_login_char(character)).unwrap_or(true);
+                            before_ok && after_ok
+                        });
+                        let replies_to_bot = privmsg
+                            .source
+                            .tags
+                            .0
+                            .get("reply-parent-user-login")
+                            .and_then(|value| value.as_ref())
+                            .is_some_and(|login| login.eq_ignore_ascii_case(&bot_username));
+                        metadata.insert(
+                            "twitch_mentions_or_replies_to_bot".into(),
+                            serde_json::Value::Bool(mentions_bot || replies_to_bot),
                         );
 
                         let formatted_author = format!(
@@ -178,6 +331,7 @@ impl Messaging for TwitchAdapter {
                         let inbound = InboundMessage {
                             id: privmsg.message_id.clone(),
                             source: "twitch".into(),
+                            adapter: Some(runtime_key.clone()),
                             conversation_id,
                             sender_id: privmsg.sender.id.clone(),
                             agent_id: None,

@@ -4,14 +4,16 @@
 //! (name, description, metadata) and a markdown body with instructions.
 //! Compatible with OpenClaw's skill format and skills.sh registry.
 //!
-//! Skills are loaded from two sources (later wins on name conflicts):
-//! 1. Instance-level: `{instance_dir}/skills/`
-//! 2. Agent workspace: `{workspace}/skills/`
+//! Skills are loaded from three sources (later wins on name conflicts):
+//! 1. Built-in: embedded in the binary at compile time
+//! 2. Instance-level: `{instance_dir}/skills/`
+//! 3. Agent workspace: `{workspace}/skills/`
 //!
 //! The channel sees a summary of available skills and is instructed to
 //! delegate skill work to workers. Workers receive the full skill content
 //! in their system prompt.
 
+pub mod builtin;
 mod installer;
 
 pub use installer::{install_from_file, install_from_github};
@@ -35,11 +37,15 @@ pub struct Skill {
     pub content: String,
     /// Where this skill was loaded from.
     pub source: SkillSource,
+    /// GitHub `owner/repo` that this skill was installed from, if any.
+    pub source_repo: Option<String>,
 }
 
 /// Where a skill was loaded from, used for precedence tracking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillSource {
+    /// Compiled into the binary.
+    Builtin,
     /// Instance-level `{instance_dir}/skills/`.
     Instance,
     /// Agent workspace `{workspace}/skills/`.
@@ -54,31 +60,34 @@ pub struct SkillSet {
 }
 
 impl SkillSet {
-    /// Load skills from instance and workspace directories.
+    /// Load skills from builtin, instance, and workspace sources.
     ///
-    /// Workspace skills override instance skills with the same name.
+    /// Precedence: Builtin < Instance < Workspace (later wins on name conflicts).
     pub async fn load(instance_skills_dir: &Path, workspace_skills_dir: &Path) -> Self {
         let mut set = Self::default();
 
-        // Instance skills (lowest precedence)
-        if instance_skills_dir.is_dir() {
-            if let Ok(skills) =
+        // Builtin skills (lowest precedence)
+        for skill in builtin::load() {
+            set.skills.insert(skill.name.to_lowercase(), skill);
+        }
+
+        // Instance skills
+        if instance_skills_dir.is_dir()
+            && let Ok(skills) =
                 load_skills_from_dir(instance_skills_dir, SkillSource::Instance).await
-            {
-                for skill in skills {
-                    set.skills.insert(skill.name.to_lowercase(), skill);
-                }
+        {
+            for skill in skills {
+                set.skills.insert(skill.name.to_lowercase(), skill);
             }
         }
 
         // Workspace skills (highest precedence, overrides instance)
-        if workspace_skills_dir.is_dir() {
-            if let Ok(skills) =
+        if workspace_skills_dir.is_dir()
+            && let Ok(skills) =
                 load_skills_from_dir(workspace_skills_dir, SkillSource::Workspace).await
-            {
-                for skill in skills {
-                    set.skills.insert(skill.name.to_lowercase(), skill);
-                }
+        {
+            for skill in skills {
+                set.skills.insert(skill.name.to_lowercase(), skill);
             }
         }
 
@@ -117,9 +126,12 @@ impl SkillSet {
     ///
     /// The channel sees skill names and descriptions but is instructed to
     /// delegate actual skill execution to workers.
-    pub fn render_channel_prompt(&self, prompt_engine: &crate::prompts::PromptEngine) -> String {
+    pub fn render_channel_prompt(
+        &self,
+        prompt_engine: &crate::prompts::PromptEngine,
+    ) -> crate::error::Result<String> {
         if self.skills.is_empty() {
-            return String::new();
+            return Ok(String::new());
         }
 
         let mut sorted_skills: Vec<&Skill> = self.skills.values().collect();
@@ -131,40 +143,75 @@ impl SkillSet {
                 name: s.name.clone(),
                 description: s.description.clone(),
                 location: s.file_path.display().to_string(),
+                suggested: false,
             })
             .collect();
 
-        prompt_engine
-            .render_skills_channel(skill_infos)
-            .expect("failed to render skills channel prompt")
+        prompt_engine.render_skills_channel(skill_infos)
     }
 
-    /// Render the skills section for injection into a worker system prompt.
+    /// Render the skills listing for injection into a worker system prompt.
     ///
-    /// Workers get the full skill content so they can follow the instructions
-    /// directly without needing to read the file.
-    pub fn render_worker_prompt(
+    /// Workers see all available skills with any channel-suggested skills flagged.
+    /// They decide which skills are relevant and read them via the read_skill tool.
+    pub fn render_worker_skills(
         &self,
-        skill_name: &str,
+        suggested: &[&str],
         prompt_engine: &crate::prompts::PromptEngine,
-    ) -> Option<String> {
-        let skill = self.get(skill_name)?;
+    ) -> crate::error::Result<String> {
+        if self.skills.is_empty() {
+            return Ok(String::new());
+        }
 
-        Some(
-            prompt_engine
-                .render_skills_worker(&skill.name, &skill.content)
-                .expect("failed to render skills worker prompt"),
-        )
+        let mut sorted_skills: Vec<&Skill> = self.skills.values().collect();
+        sorted_skills.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let suggested_lower: Vec<String> = suggested.iter().map(|s| s.to_lowercase()).collect();
+
+        let skill_infos: Vec<crate::prompts::SkillInfo> = sorted_skills
+            .into_iter()
+            .map(|s| crate::prompts::SkillInfo {
+                suggested: suggested_lower.contains(&s.name.to_lowercase()),
+                name: s.name.clone(),
+                description: s.description.clone(),
+                location: s.file_path.display().to_string(),
+            })
+            .collect();
+
+        prompt_engine.render_skills_worker(skill_infos)
     }
 
     /// Remove a skill by name.
     ///
+    /// Only workspace-level skills can be removed via this method. Built-in
+    /// and instance-level skills cannot be deleted through the per-agent API.
+    ///
     /// Returns the base directory path if the skill was found and removed.
     pub async fn remove(&mut self, name: &str) -> anyhow::Result<Option<PathBuf>> {
-        let skill = match self.skills.remove(&name.to_lowercase()) {
+        let key = name.to_lowercase();
+        let skill = match self.skills.get(&key) {
             Some(s) => s,
             None => return Ok(None),
         };
+
+        if skill.source == SkillSource::Builtin {
+            anyhow::bail!(
+                "cannot remove built-in skill '{}'; \
+                 built-in skills are compiled into the binary",
+                name
+            );
+        }
+
+        if skill.source == SkillSource::Instance {
+            anyhow::bail!(
+                "cannot remove instance-level skill '{}' via the agent API; \
+                 instance skills are shared across all agents and must be \
+                 removed from the instance skills directory directly",
+                name
+            );
+        }
+
+        let skill = self.skills.remove(&key).unwrap();
 
         // Remove the skill directory from disk
         if skill.base_dir.exists() {
@@ -200,6 +247,7 @@ impl SkillSet {
                 file_path: s.file_path.clone(),
                 base_dir: s.base_dir.clone(),
                 source: s.source.clone(),
+                source_repo: s.source_repo.clone(),
             })
             .collect()
     }
@@ -213,6 +261,7 @@ pub struct SkillInfo {
     pub file_path: PathBuf,
     pub base_dir: PathBuf,
     pub source: SkillSource,
+    pub source_repo: Option<String>,
 }
 
 /// Load all skills from a directory.
@@ -280,6 +329,7 @@ async fn load_skill(
     });
 
     let description = frontmatter.get("description").cloned().unwrap_or_default();
+    let source_repo = frontmatter.get("source_repo").cloned();
 
     // Resolve {baseDir} template variable in the body
     let base_dir_str = base_dir.to_string_lossy();
@@ -292,6 +342,7 @@ async fn load_skill(
         base_dir: base_dir.to_path_buf(),
         content,
         source,
+        source_repo,
     })
 }
 
@@ -299,7 +350,9 @@ async fn load_skill(
 ///
 /// Expects `---` delimiters. Returns the frontmatter key-value pairs and
 /// the remaining body. Compatible with OpenClaw's frontmatter format.
-fn parse_frontmatter(content: &str) -> anyhow::Result<(HashMap<String, String>, String)> {
+pub(crate) fn parse_frontmatter(
+    content: &str,
+) -> anyhow::Result<(HashMap<String, String>, String)> {
     let trimmed = content.trim_start();
 
     if !trimmed.starts_with("---") {
@@ -437,7 +490,7 @@ mod tests {
     fn test_skill_set_channel_prompt_empty() {
         let set = SkillSet::default();
         let engine = crate::prompts::PromptEngine::new("en").unwrap();
-        assert!(set.render_channel_prompt(&engine).is_empty());
+        assert!(set.render_channel_prompt(&engine).unwrap().is_empty());
     }
 
     #[test]
@@ -452,18 +505,19 @@ mod tests {
                 base_dir: PathBuf::from("/skills/weather"),
                 content: "# Weather\n\nUse curl.".into(),
                 source: SkillSource::Instance,
+                source_repo: None,
             },
         );
 
         let engine = crate::prompts::PromptEngine::new("en").unwrap();
-        let prompt = set.render_channel_prompt(&engine);
+        let prompt = set.render_channel_prompt(&engine).unwrap();
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("<name>weather</name>"));
         assert!(prompt.contains("<description>Get weather forecasts</description>"));
     }
 
     #[test]
-    fn test_skill_set_worker_prompt() {
+    fn test_skill_set_worker_skills() {
         let mut set = SkillSet::default();
         set.skills.insert(
             "weather".into(),
@@ -474,16 +528,114 @@ mod tests {
                 base_dir: PathBuf::from("/skills/weather"),
                 content: "# Weather\n\nUse curl.".into(),
                 source: SkillSource::Instance,
+                source_repo: None,
             },
         );
 
         let engine = crate::prompts::PromptEngine::new("en").unwrap();
-        let prompt = set.render_worker_prompt("weather", &engine).unwrap();
-        assert!(prompt.contains("## Skill Instructions"));
-        assert!(prompt.contains("**weather**"));
-        assert!(prompt.contains("# Weather"));
-        assert!(prompt.contains("Use curl."));
 
-        assert!(set.render_worker_prompt("nonexistent", &engine).is_none());
+        // Without suggestions
+        let prompt = set.render_worker_skills(&[], &engine).unwrap();
+        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.contains("<name>weather</name>"));
+        assert!(prompt.contains("<description>Get weather forecasts</description>"));
+        assert!(!prompt.contains("suggested=\"true\""));
+
+        // With suggestion
+        let prompt = set.render_worker_skills(&["weather"], &engine).unwrap();
+        assert!(prompt.contains("suggested=\"true\""));
+
+        // Empty set returns empty string
+        let empty_set = SkillSet::default();
+        let prompt = empty_set.render_worker_skills(&[], &engine).unwrap();
+        assert!(prompt.is_empty());
+    }
+
+    fn make_skill(name: &str, source: SkillSource) -> Skill {
+        Skill {
+            name: name.into(),
+            description: format!("{name} skill"),
+            file_path: PathBuf::from(format!("/skills/{name}/SKILL.md")),
+            base_dir: PathBuf::from(format!("/tmp/test-skills-{}", uuid::Uuid::new_v4())),
+            content: format!("# {name}"),
+            source,
+            source_repo: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_builtin_skill_is_rejected() {
+        let mut set = SkillSet::default();
+        set.skills.insert(
+            "my-skill".into(),
+            make_skill("my-skill", SkillSource::Builtin),
+        );
+
+        let result = set.remove("my-skill").await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("built-in skill"), "unexpected error: {msg}");
+        assert!(set.skills.contains_key("my-skill"));
+    }
+
+    #[tokio::test]
+    async fn remove_instance_skill_is_rejected() {
+        let mut set = SkillSet::default();
+        set.skills.insert(
+            "my-skill".into(),
+            make_skill("my-skill", SkillSource::Instance),
+        );
+
+        let result = set.remove("my-skill").await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("instance-level skill"),
+            "unexpected error: {msg}"
+        );
+
+        // Skill should still be in the set (not removed)
+        assert!(set.skills.contains_key("my-skill"));
+    }
+
+    #[tokio::test]
+    async fn remove_workspace_skill_succeeds() {
+        let mut set = SkillSet::default();
+        let skill = make_skill("my-skill", SkillSource::Workspace);
+        // Don't create the directory on disk - remove should still return the path
+        let expected_dir = skill.base_dir.clone();
+        set.skills.insert("my-skill".into(), skill);
+
+        let result = set.remove("my-skill").await;
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert_eq!(path, Some(expected_dir));
+        assert!(!set.skills.contains_key("my-skill"));
+    }
+
+    #[tokio::test]
+    async fn remove_nonexistent_skill_returns_none() {
+        let mut set = SkillSet::default();
+        let result = set.remove("nonexistent").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_is_case_insensitive() {
+        let mut set = SkillSet::default();
+        set.skills.insert(
+            "my-skill".into(),
+            make_skill("my-skill", SkillSource::Instance),
+        );
+
+        let result = set.remove("MY-SKILL").await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("instance-level skill")
+        );
     }
 }

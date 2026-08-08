@@ -6,32 +6,37 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct BindingResponse {
     agent_id: String,
     channel: String,
+    adapter: Option<String>,
     guild_id: Option<String>,
     workspace_id: Option<String>,
     chat_id: Option<String>,
+    team_id: Option<String>,
     channel_ids: Vec<String>,
+    require_mention: bool,
     dm_allowed_users: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct BindingsListResponse {
     bindings: Vec<BindingResponse>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub(super) struct BindingsQuery {
     #[serde(default)]
     agent_id: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct CreateBindingRequest {
     agent_id: String,
     channel: String,
+    #[serde(default)]
+    adapter: Option<String>,
     #[serde(default)]
     guild_id: Option<String>,
     #[serde(default)]
@@ -39,7 +44,11 @@ pub(super) struct CreateBindingRequest {
     #[serde(default)]
     chat_id: Option<String>,
     #[serde(default)]
+    team_id: Option<String>,
+    #[serde(default)]
     channel_ids: Vec<String>,
+    #[serde(default)]
+    require_mention: bool,
     #[serde(default)]
     dm_allowed_users: Vec<String>,
     /// Optional: set platform credentials if not yet configured.
@@ -47,7 +56,7 @@ pub(super) struct CreateBindingRequest {
     platform_credentials: Option<PlatformCredentials>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct PlatformCredentials {
     #[serde(default)]
     discord_token: Option<String>,
@@ -58,12 +67,38 @@ pub(super) struct PlatformCredentials {
     #[serde(default)]
     telegram_token: Option<String>,
     #[serde(default)]
+    email_imap_host: Option<String>,
+    #[serde(default)]
+    email_imap_port: Option<u16>,
+    #[serde(default)]
+    email_imap_username: Option<String>,
+    #[serde(default)]
+    email_imap_password: Option<String>,
+    #[serde(default)]
+    email_smtp_host: Option<String>,
+    #[serde(default)]
+    email_smtp_port: Option<u16>,
+    #[serde(default)]
+    email_smtp_username: Option<String>,
+    #[serde(default)]
+    email_smtp_password: Option<String>,
+    #[serde(default)]
+    email_from_address: Option<String>,
+    #[serde(default)]
+    email_from_name: Option<String>,
+    #[serde(default)]
     twitch_username: Option<String>,
     #[serde(default)]
     twitch_oauth_token: Option<String>,
+    #[serde(default)]
+    twitch_client_id: Option<String>,
+    #[serde(default)]
+    twitch_client_secret: Option<String>,
+    #[serde(default)]
+    twitch_refresh_token: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct CreateBindingResponse {
     success: bool,
     /// True if platform credentials were added/changed (adapter needs restart).
@@ -71,37 +106,47 @@ pub(super) struct CreateBindingResponse {
     message: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct DeleteBindingRequest {
     agent_id: String,
     channel: String,
+    #[serde(default)]
+    adapter: Option<String>,
     #[serde(default)]
     guild_id: Option<String>,
     #[serde(default)]
     workspace_id: Option<String>,
     #[serde(default)]
     chat_id: Option<String>,
+    #[serde(default)]
+    team_id: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct DeleteBindingResponse {
     success: bool,
     message: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct UpdateBindingRequest {
     original_agent_id: String,
     original_channel: String,
+    #[serde(default)]
+    original_adapter: Option<String>,
     #[serde(default)]
     original_guild_id: Option<String>,
     #[serde(default)]
     original_workspace_id: Option<String>,
     #[serde(default)]
     original_chat_id: Option<String>,
+    #[serde(default)]
+    original_team_id: Option<String>,
 
     agent_id: String,
     channel: String,
+    #[serde(default)]
+    adapter: Option<String>,
     #[serde(default)]
     guild_id: Option<String>,
     #[serde(default)]
@@ -109,18 +154,34 @@ pub(super) struct UpdateBindingRequest {
     #[serde(default)]
     chat_id: Option<String>,
     #[serde(default)]
+    team_id: Option<String>,
+    #[serde(default)]
     channel_ids: Vec<String>,
+    #[serde(default)]
+    require_mention: bool,
     #[serde(default)]
     dm_allowed_users: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct UpdateBindingResponse {
     success: bool,
     message: String,
 }
 
 /// List all bindings, optionally filtered by agent_id.
+#[utoipa::path(
+    get,
+    path = "/bindings",
+    params(
+        ("agent_id" = Option<String>, Query, description = "Filter by agent ID"),
+    ),
+    responses(
+        (status = 200, body = BindingsListResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "bindings",
+)]
 pub(super) async fn list_bindings(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<BindingsQuery>,
@@ -137,14 +198,17 @@ pub(super) async fn list_bindings(
 
     let filtered: Vec<BindingResponse> = bindings
         .into_iter()
-        .filter(|b| query.agent_id.as_ref().map_or(true, |id| &b.agent_id == id))
+        .filter(|b| query.agent_id.as_ref().is_none_or(|id| &b.agent_id == id))
         .map(|b| BindingResponse {
             agent_id: b.agent_id,
             channel: b.channel,
+            adapter: b.adapter,
             guild_id: b.guild_id,
             workspace_id: b.workspace_id,
             chat_id: b.chat_id,
+            team_id: b.team_id,
             channel_ids: b.channel_ids,
+            require_mention: b.require_mention,
             dm_allowed_users: b.dm_allowed_users,
         })
         .collect();
@@ -153,6 +217,17 @@ pub(super) async fn list_bindings(
 }
 
 /// Create a new binding (and optionally configure platform credentials).
+#[utoipa::path(
+    post,
+    path = "/bindings",
+    request_body = CreateBindingRequest,
+    responses(
+        (status = 200, body = CreateBindingResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "bindings",
+)]
 pub(super) async fn create_binding(
     State(state): State<Arc<ApiState>>,
     axum::Json(request): axum::Json<CreateBindingRequest>,
@@ -181,27 +256,28 @@ pub(super) async fn create_binding(
     let mut new_discord_token: Option<String> = None;
     let mut new_slack_tokens: Option<(String, String)> = None;
     let mut new_telegram_token: Option<String> = None;
+    let mut new_email_configured = false;
     let mut new_twitch_creds: Option<(String, String)> = None;
 
     if let Some(credentials) = &request.platform_credentials {
-        if let Some(token) = &credentials.discord_token {
-            if !token.is_empty() {
-                if doc.get("messaging").is_none() {
-                    doc["messaging"] = toml_edit::Item::Table(toml_edit::Table::new());
-                }
-                let messaging = doc["messaging"]
-                    .as_table_mut()
-                    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-                if !messaging.contains_key("discord") {
-                    messaging["discord"] = toml_edit::Item::Table(toml_edit::Table::new());
-                }
-                let discord = messaging["discord"]
-                    .as_table_mut()
-                    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-                discord["enabled"] = toml_edit::value(true);
-                discord["token"] = toml_edit::value(token.as_str());
-                new_discord_token = Some(token.clone());
+        if let Some(token) = &credentials.discord_token
+            && !token.is_empty()
+        {
+            if doc.get("messaging").is_none() {
+                doc["messaging"] = toml_edit::Item::Table(toml_edit::Table::new());
             }
+            let messaging = doc["messaging"]
+                .as_table_mut()
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+            if !messaging.contains_key("discord") {
+                messaging["discord"] = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            let discord = messaging["discord"]
+                .as_table_mut()
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+            discord["enabled"] = toml_edit::value(true);
+            discord["token"] = toml_edit::value(token.as_str());
+            new_discord_token = Some(token.clone());
         }
         if let Some(bot_token) = &credentials.slack_bot_token {
             let app_token = credentials.slack_app_token.as_deref().unwrap_or("");
@@ -224,27 +300,115 @@ pub(super) async fn create_binding(
                 new_slack_tokens = Some((bot_token.clone(), app_token.to_string()));
             }
         }
-        if let Some(token) = &credentials.telegram_token {
-            if !token.is_empty() {
-                if doc.get("messaging").is_none() {
-                    doc["messaging"] = toml_edit::Item::Table(toml_edit::Table::new());
-                }
-                let messaging = doc["messaging"]
-                    .as_table_mut()
-                    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-                if !messaging.contains_key("telegram") {
-                    messaging["telegram"] = toml_edit::Item::Table(toml_edit::Table::new());
-                }
-                let telegram = messaging["telegram"]
-                    .as_table_mut()
-                    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-                telegram["enabled"] = toml_edit::value(true);
-                telegram["token"] = toml_edit::value(token.as_str());
-                new_telegram_token = Some(token.clone());
+        if let Some(token) = &credentials.telegram_token
+            && !token.is_empty()
+        {
+            if doc.get("messaging").is_none() {
+                doc["messaging"] = toml_edit::Item::Table(toml_edit::Table::new());
             }
+            let messaging = doc["messaging"]
+                .as_table_mut()
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+            if !messaging.contains_key("telegram") {
+                messaging["telegram"] = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            let telegram = messaging["telegram"]
+                .as_table_mut()
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+            telegram["enabled"] = toml_edit::value(true);
+            telegram["token"] = toml_edit::value(token.as_str());
+            new_telegram_token = Some(token.clone());
         }
+
+        let email_imap_host = credentials
+            .email_imap_host
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let email_imap_username = credentials
+            .email_imap_username
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let email_imap_password = credentials
+            .email_imap_password
+            .as_deref()
+            .unwrap_or("")
+            .to_string();
+        let email_smtp_host = credentials
+            .email_smtp_host
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let email_smtp_username = credentials
+            .email_smtp_username
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let email_smtp_password = credentials
+            .email_smtp_password
+            .as_deref()
+            .unwrap_or("")
+            .to_string();
+        let email_from_address = credentials
+            .email_from_address
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        if !email_imap_host.is_empty()
+            && !email_imap_username.is_empty()
+            && !email_imap_password.is_empty()
+            && !email_smtp_host.is_empty()
+            && !email_smtp_username.is_empty()
+            && !email_smtp_password.is_empty()
+            && !email_from_address.is_empty()
+        {
+            if doc.get("messaging").is_none() {
+                doc["messaging"] = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            let messaging = doc["messaging"]
+                .as_table_mut()
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+            if !messaging.contains_key("email") {
+                messaging["email"] = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            let email = messaging["email"]
+                .as_table_mut()
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+            email["enabled"] = toml_edit::value(true);
+            email["imap_host"] = toml_edit::value(email_imap_host);
+            email["imap_port"] =
+                toml_edit::value(i64::from(credentials.email_imap_port.unwrap_or(993)));
+            email["imap_username"] = toml_edit::value(email_imap_username);
+            email["imap_password"] = toml_edit::value(email_imap_password);
+            email["smtp_host"] = toml_edit::value(email_smtp_host);
+            email["smtp_port"] =
+                toml_edit::value(i64::from(credentials.email_smtp_port.unwrap_or(587)));
+            email["smtp_username"] = toml_edit::value(email_smtp_username);
+            email["smtp_password"] = toml_edit::value(email_smtp_password);
+            email["from_address"] = toml_edit::value(email_from_address);
+
+            if let Some(from_name) = &credentials.email_from_name {
+                let from_name = from_name.trim();
+                if !from_name.is_empty() {
+                    email["from_name"] = toml_edit::value(from_name);
+                }
+            }
+
+            new_email_configured = true;
+        }
+
         if let Some(username) = &credentials.twitch_username {
             let oauth_token = credentials.twitch_oauth_token.as_deref().unwrap_or("");
+            let client_id = credentials.twitch_client_id.as_deref().unwrap_or("");
+            let client_secret = credentials.twitch_client_secret.as_deref().unwrap_or("");
+            let refresh_token = credentials.twitch_refresh_token.as_deref().unwrap_or("");
             if !username.is_empty() && !oauth_token.is_empty() {
                 if doc.get("messaging").is_none() {
                     doc["messaging"] = toml_edit::Item::Table(toml_edit::Table::new());
@@ -261,6 +425,15 @@ pub(super) async fn create_binding(
                 twitch["enabled"] = toml_edit::value(true);
                 twitch["username"] = toml_edit::value(username.as_str());
                 twitch["oauth_token"] = toml_edit::value(oauth_token);
+                if !client_id.is_empty() {
+                    twitch["client_id"] = toml_edit::value(client_id);
+                }
+                if !client_secret.is_empty() {
+                    twitch["client_secret"] = toml_edit::value(client_secret);
+                }
+                if !refresh_token.is_empty() {
+                    twitch["refresh_token"] = toml_edit::value(refresh_token);
+                }
                 new_twitch_creds = Some((username.clone(), oauth_token.to_string()));
             }
         }
@@ -276,6 +449,14 @@ pub(super) async fn create_binding(
     let mut binding_table = toml_edit::Table::new();
     binding_table["agent_id"] = toml_edit::value(&request.agent_id);
     binding_table["channel"] = toml_edit::value(&request.channel);
+    if let Some(adapter) = request
+        .adapter
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        binding_table["adapter"] = toml_edit::value(adapter);
+    }
     if let Some(guild_id) = &request.guild_id {
         binding_table["guild_id"] = toml_edit::value(guild_id.as_str());
     }
@@ -285,12 +466,23 @@ pub(super) async fn create_binding(
     if let Some(chat_id) = &request.chat_id {
         binding_table["chat_id"] = toml_edit::value(chat_id.as_str());
     }
+    if let Some(team_id) = request
+        .team_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        binding_table["team_id"] = toml_edit::value(team_id);
+    }
     if !request.channel_ids.is_empty() {
         let mut arr = toml_edit::Array::new();
         for id in &request.channel_ids {
             arr.push(id.as_str());
         }
         binding_table["channel_ids"] = toml_edit::value(arr);
+    }
+    if request.require_mention {
+        binding_table["require_mention"] = toml_edit::value(true);
     }
     if !request.dm_allowed_users.is_empty() {
         let mut arr = toml_edit::Array::new();
@@ -350,12 +542,14 @@ pub(super) async fn create_binding(
                         Some(existing) => existing.clone(),
                         None => {
                             drop(perms_guard);
+                            let Some(discord_config) = new_config.messaging.discord.as_ref() else {
+                                tracing::error!(
+                                    "discord config missing despite token being provided"
+                                );
+                                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                            };
                             let perms = crate::config::DiscordPermissions::from_config(
-                                new_config
-                                    .messaging
-                                    .discord
-                                    .as_ref()
-                                    .expect("discord config exists when token is provided"),
+                                discord_config,
                                 &new_config.bindings,
                             );
                             let arc_swap =
@@ -365,7 +559,11 @@ pub(super) async fn create_binding(
                         }
                     }
                 };
-                let adapter = crate::messaging::discord::DiscordAdapter::new(&token, discord_perms);
+                let adapter = crate::messaging::discord::DiscordAdapter::new(
+                    "discord",
+                    &token,
+                    discord_perms,
+                );
                 if let Err(error) = manager.register_and_start(adapter).await {
                     tracing::error!(%error, "failed to hot-start discord adapter");
                 }
@@ -378,12 +576,14 @@ pub(super) async fn create_binding(
                         Some(existing) => existing.clone(),
                         None => {
                             drop(perms_guard);
+                            let Some(slack_config) = new_config.messaging.slack.as_ref() else {
+                                tracing::error!(
+                                    "slack config missing despite tokens being provided"
+                                );
+                                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                            };
                             let perms = crate::config::SlackPermissions::from_config(
-                                new_config
-                                    .messaging
-                                    .slack
-                                    .as_ref()
-                                    .expect("slack config exists when tokens are provided"),
+                                slack_config,
                                 &new_config.bindings,
                             );
                             let arc_swap =
@@ -400,6 +600,7 @@ pub(super) async fn create_binding(
                     .map(|s| s.commands.clone())
                     .unwrap_or_default();
                 match crate::messaging::slack::SlackAdapter::new(
+                    "slack",
                     &bot_token,
                     &app_token,
                     slack_perms,
@@ -418,29 +619,49 @@ pub(super) async fn create_binding(
 
             if let Some(token) = new_telegram_token {
                 let telegram_perms = {
+                    let Some(telegram_config) = new_config.messaging.telegram.as_ref() else {
+                        tracing::error!("telegram config missing despite token being provided");
+                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                    };
                     let perms = crate::config::TelegramPermissions::from_config(
-                        new_config
-                            .messaging
-                            .telegram
-                            .as_ref()
-                            .expect("telegram config exists when token is provided"),
+                        telegram_config,
                         &new_config.bindings,
                     );
                     std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(perms))
                 };
-                let adapter =
-                    crate::messaging::telegram::TelegramAdapter::new(&token, telegram_perms);
+                let adapter = crate::messaging::telegram::TelegramAdapter::new(
+                    "telegram",
+                    &token,
+                    telegram_perms,
+                );
                 if let Err(error) = manager.register_and_start(adapter).await {
                     tracing::error!(%error, "failed to hot-start telegram adapter");
                 }
             }
 
+            if new_email_configured {
+                let Some(email_config) = new_config.messaging.email.as_ref() else {
+                    tracing::error!("email config missing despite credentials being provided");
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                };
+
+                match crate::messaging::email::EmailAdapter::from_config(email_config) {
+                    Ok(adapter) => {
+                        if let Err(error) = manager.register_and_start(adapter).await {
+                            tracing::error!(%error, "failed to hot-start email adapter");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "failed to build email adapter");
+                    }
+                }
+            }
+
             if let Some((username, oauth_token)) = new_twitch_creds {
-                let twitch_config = new_config
-                    .messaging
-                    .twitch
-                    .as_ref()
-                    .expect("twitch config exists when credentials are provided");
+                let Some(twitch_config) = new_config.messaging.twitch.as_ref() else {
+                    tracing::error!("twitch config missing despite credentials being provided");
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                };
                 let twitch_perms = {
                     let perms = crate::config::TwitchPermissions::from_config(
                         twitch_config,
@@ -448,9 +669,16 @@ pub(super) async fn create_binding(
                     );
                     std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(perms))
                 };
+                let instance_dir = state.instance_dir.load();
+                let token_path = instance_dir.join("twitch_token.json");
                 let adapter = crate::messaging::twitch::TwitchAdapter::new(
+                    "twitch",
                     &username,
                     &oauth_token,
+                    twitch_config.client_id.clone(),
+                    twitch_config.client_secret.clone(),
+                    twitch_config.refresh_token.clone(),
+                    Some(token_path),
                     twitch_config.channels.clone(),
                     twitch_config.trigger_prefix.clone(),
                     twitch_perms,
@@ -469,6 +697,18 @@ pub(super) async fn create_binding(
     }))
 }
 
+/// Update an existing binding.
+#[utoipa::path(
+    put,
+    path = "/bindings",
+    request_body = UpdateBindingRequest,
+    responses(
+        (status = 200, body = UpdateBindingResponse),
+        (status = 404, description = "Binding not found or config not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "bindings",
+)]
 pub(super) async fn update_binding(
     State(state): State<Arc<ApiState>>,
     axum::Json(request): axum::Json<UpdateBindingRequest>,
@@ -495,6 +735,12 @@ pub(super) async fn update_binding(
         .and_then(|b| b.as_array_of_tables_mut())
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    let request_team_id = request
+        .original_team_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
     let mut match_idx: Option<usize> = None;
     for (i, table) in bindings_array.iter().enumerate() {
         let matches_agent = table
@@ -505,28 +751,48 @@ pub(super) async fn update_binding(
             .get("channel")
             .and_then(|v| v.as_str())
             .is_some_and(|v| v == request.original_channel);
+        let matches_adapter = match &request.original_adapter {
+            Some(adapter) => table
+                .get("adapter")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v == adapter),
+            None => table.get("adapter").is_none(),
+        };
         let matches_guild = match &request.original_guild_id {
-            Some(gid) => table
+            Some(guild_id) => table
                 .get("guild_id")
                 .and_then(|v| v.as_str())
-                .is_some_and(|v| v == gid),
+                .is_some_and(|v| v == guild_id),
             None => table.get("guild_id").is_none(),
         };
         let matches_workspace = match &request.original_workspace_id {
-            Some(wid) => table
+            Some(workspace_id) => table
                 .get("workspace_id")
                 .and_then(|v| v.as_str())
-                .is_some_and(|v| v == wid),
+                .is_some_and(|v| v == workspace_id),
             None => table.get("workspace_id").is_none(),
         };
         let matches_chat = match &request.original_chat_id {
-            Some(cid) => table
+            Some(chat_id) => table
                 .get("chat_id")
                 .and_then(|v| v.as_str())
-                .is_some_and(|v| v == cid),
+                .is_some_and(|v| v == chat_id),
             None => table.get("chat_id").is_none(),
         };
-        if matches_agent && matches_channel && matches_guild && matches_workspace && matches_chat {
+        let toml_team_id = table
+            .get("team_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let matches_team = request_team_id == toml_team_id;
+        if matches_agent
+            && matches_channel
+            && matches_adapter
+            && matches_guild
+            && matches_workspace
+            && matches_chat
+            && matches_team
+        {
             match_idx = Some(i);
             break;
         }
@@ -546,24 +812,43 @@ pub(super) async fn update_binding(
     binding["agent_id"] = toml_edit::value(&request.agent_id);
     binding["channel"] = toml_edit::value(&request.channel);
 
+    binding.remove("adapter");
     binding.remove("guild_id");
     binding.remove("workspace_id");
     binding.remove("chat_id");
+    binding.remove("team_id");
 
-    if let Some(ref guild_id) = request.guild_id {
-        if !guild_id.is_empty() {
-            binding["guild_id"] = toml_edit::value(guild_id);
-        }
+    if let Some(adapter) = request
+        .adapter
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        binding["adapter"] = toml_edit::value(adapter);
     }
-    if let Some(ref workspace_id) = request.workspace_id {
-        if !workspace_id.is_empty() {
-            binding["workspace_id"] = toml_edit::value(workspace_id);
-        }
+
+    if let Some(ref guild_id) = request.guild_id
+        && !guild_id.is_empty()
+    {
+        binding["guild_id"] = toml_edit::value(guild_id);
     }
-    if let Some(ref chat_id) = request.chat_id {
-        if !chat_id.is_empty() {
-            binding["chat_id"] = toml_edit::value(chat_id);
-        }
+    if let Some(ref workspace_id) = request.workspace_id
+        && !workspace_id.is_empty()
+    {
+        binding["workspace_id"] = toml_edit::value(workspace_id);
+    }
+    if let Some(ref chat_id) = request.chat_id
+        && !chat_id.is_empty()
+    {
+        binding["chat_id"] = toml_edit::value(chat_id);
+    }
+    if let Some(team_id) = request
+        .team_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        binding["team_id"] = toml_edit::value(team_id);
     }
 
     if !request.channel_ids.is_empty() {
@@ -574,6 +859,12 @@ pub(super) async fn update_binding(
         binding["channel_ids"] = toml_edit::value(arr);
     } else {
         binding.remove("channel_ids");
+    }
+
+    if request.require_mention {
+        binding["require_mention"] = toml_edit::value(true);
+    } else {
+        binding.remove("require_mention");
     }
 
     if !request.dm_allowed_users.is_empty() {
@@ -634,6 +925,17 @@ pub(super) async fn update_binding(
 }
 
 /// Delete a binding by matching agent_id + channel + platform-specific identifiers.
+#[utoipa::path(
+    delete,
+    path = "/bindings",
+    request_body = DeleteBindingRequest,
+    responses(
+        (status = 200, body = DeleteBindingResponse),
+        (status = 404, description = "Binding not found or config not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "bindings",
+)]
 pub(super) async fn delete_binding(
     State(state): State<Arc<ApiState>>,
     axum::Json(request): axum::Json<DeleteBindingRequest>,
@@ -660,6 +962,12 @@ pub(super) async fn delete_binding(
         .and_then(|b| b.as_array_of_tables_mut())
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    let request_team_id = request
+        .team_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
     let mut match_idx: Option<usize> = None;
     for (i, table) in bindings_array.iter().enumerate() {
         let matches_agent = table
@@ -670,28 +978,48 @@ pub(super) async fn delete_binding(
             .get("channel")
             .and_then(|v: &toml_edit::Item| v.as_str())
             .is_some_and(|v| v == request.channel);
+        let matches_adapter = match &request.adapter {
+            Some(adapter) => table
+                .get("adapter")
+                .and_then(|v: &toml_edit::Item| v.as_str())
+                .is_some_and(|v| v == adapter),
+            None => table.get("adapter").is_none(),
+        };
         let matches_guild = match &request.guild_id {
-            Some(gid) => table
+            Some(guild_id) => table
                 .get("guild_id")
                 .and_then(|v: &toml_edit::Item| v.as_str())
-                .is_some_and(|v| v == gid),
+                .is_some_and(|v| v == guild_id),
             None => table.get("guild_id").is_none(),
         };
         let matches_workspace = match &request.workspace_id {
-            Some(wid) => table
+            Some(workspace_id) => table
                 .get("workspace_id")
                 .and_then(|v: &toml_edit::Item| v.as_str())
-                .is_some_and(|v| v == wid),
+                .is_some_and(|v| v == workspace_id),
             None => table.get("workspace_id").is_none(),
         };
         let matches_chat = match &request.chat_id {
-            Some(cid) => table
+            Some(chat_id) => table
                 .get("chat_id")
                 .and_then(|v: &toml_edit::Item| v.as_str())
-                .is_some_and(|v| v == cid),
+                .is_some_and(|v| v == chat_id),
             None => table.get("chat_id").is_none(),
         };
-        if matches_agent && matches_channel && matches_guild && matches_workspace && matches_chat {
+        let toml_team_id = table
+            .get("team_id")
+            .and_then(|v: &toml_edit::Item| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let matches_team = request_team_id == toml_team_id;
+        if matches_agent
+            && matches_channel
+            && matches_adapter
+            && matches_guild
+            && matches_workspace
+            && matches_chat
+            && matches_team
+        {
             match_idx = Some(i);
             break;
         }

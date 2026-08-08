@@ -5,24 +5,26 @@
 //! the integration point for scripts, CI pipelines, and other programs
 //! that need to interact with Spacebot programmatically.
 
-use crate::messaging::traits::{InboundStream, Messaging};
-use crate::{InboundMessage, MessageContent, OutboundResponse};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use axum::Router;
 use axum::extract::{Json, State};
-use axum::http::StatusCode;
+use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
-
-use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
+
+use crate::messaging::traits::{InboundStream, Messaging};
+use crate::{InboundMessage, MessageContent, OutboundResponse};
 
 /// Webhook adapter state.
 pub struct WebhookAdapter {
     port: u16,
     bind: String,
+    auth_token: Option<String>,
     inbound_tx: Arc<RwLock<Option<mpsc::Sender<InboundMessage>>>>,
     /// Buffered responses per conversation_id, waiting to be polled.
     response_buffers: Arc<RwLock<HashMap<String, Vec<WebhookResponse>>>>,
@@ -34,6 +36,8 @@ pub struct WebhookAdapter {
 struct AppState {
     inbound_tx: Arc<RwLock<Option<mpsc::Sender<InboundMessage>>>>,
     response_buffers: Arc<RwLock<HashMap<String, Vec<WebhookResponse>>>>,
+    auth_token: Option<String>,
+    runtime_key: String,
 }
 
 /// Inbound webhook request body.
@@ -72,10 +76,11 @@ struct PollResponse {
 }
 
 impl WebhookAdapter {
-    pub fn new(port: u16, bind: impl Into<String>) -> Self {
+    pub fn new(port: u16, bind: impl Into<String>, auth_token: Option<String>) -> Self {
         Self {
             port,
             bind: bind.into(),
+            auth_token,
             inbound_tx: Arc::new(RwLock::new(None)),
             response_buffers: Arc::new(RwLock::new(HashMap::new())),
             shutdown_tx: Arc::new(RwLock::new(None)),
@@ -98,7 +103,15 @@ impl Messaging for WebhookAdapter {
         let state = AppState {
             inbound_tx: self.inbound_tx.clone(),
             response_buffers: self.response_buffers.clone(),
+            auth_token: self.auth_token.clone(),
+            runtime_key: self.name().to_string(),
         };
+
+        if self.auth_token.is_none() {
+            tracing::warn!(
+                "webhook authentication is disabled because no auth token is configured"
+            );
+        }
 
         let app = Router::new()
             .route("/send", post(handle_send))
@@ -226,9 +239,14 @@ impl Messaging for WebhookAdapter {
 // -- Axum handlers --
 
 async fn handle_send(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(request): Json<WebhookRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    if !is_authorized(&headers, state.auth_token.as_deref()) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
+    }
+
     let tx = state.inbound_tx.read().await;
     let Some(tx) = tx.as_ref() else {
         return Err((
@@ -246,12 +264,21 @@ async fn handle_send(
         "display_name".into(),
         serde_json::Value::String(request.sender_id.clone()),
     );
+    metadata.insert(
+        "sender_display_name".into(),
+        serde_json::Value::String(request.sender_id.clone()),
+    );
+    metadata.insert(
+        crate::metadata_keys::CHANNEL_NAME.into(),
+        serde_json::Value::String(request.conversation_id.clone()),
+    );
 
     let conversation_id = format!("webhook:{}", request.conversation_id);
 
     let inbound = InboundMessage {
         id: uuid::Uuid::new_v4().to_string(),
         source: "webhook".into(),
+        adapter: Some(state.runtime_key.clone()),
         conversation_id,
         sender_id: request.sender_id.clone(),
         agent_id: request.agent_id.map(Into::into),
@@ -269,9 +296,14 @@ async fn handle_send(
 }
 
 async fn handle_poll(
+    headers: HeaderMap,
     State(state): State<AppState>,
     axum::extract::Path(conversation_id): axum::extract::Path<String>,
-) -> Json<PollResponse> {
+) -> Result<Json<PollResponse>, (StatusCode, String)> {
+    if !is_authorized(&headers, state.auth_token.as_deref()) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
+    }
+
     let key = format!("webhook:{conversation_id}");
     let messages = state
         .response_buffers
@@ -280,9 +312,29 @@ async fn handle_poll(
         .remove(&key)
         .unwrap_or_default();
 
-    Json(PollResponse { messages })
+    Ok(Json(PollResponse { messages }))
 }
 
 async fn handle_health() -> StatusCode {
     StatusCode::OK
+}
+
+fn is_authorized(headers: &HeaderMap, expected_token: Option<&str>) -> bool {
+    let Some(expected_token) = expected_token else {
+        return true;
+    };
+
+    if headers
+        .get("x-webhook-token")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|token| token == expected_token)
+    {
+        return true;
+    }
+
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| token == expected_token)
 }
